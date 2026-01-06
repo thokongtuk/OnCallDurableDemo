@@ -1,0 +1,43 @@
+{
+  "version": "2.0",
+  "logging": {
+    "logLevel": {
+      "default": "None",
+
+      // --- ปิด System Logs ทั้งหมด ---
+      "Host": "Error",
+      "Function": "Error",
+      "Host.Results": "None",
+      "Host.Aggregator": "None",
+      "Microsoft": "None",
+      "Worker": "None",
+      "Azure": "None",
+
+      // --- ปิด Durable Functions ---
+      "DurableTask": "None",
+      "DurableTask.Core": "None",
+      "DurableTask.AzureStorage": "None",
+      "Microsoft.Azure.WebJobs.Extensions.DurableTask": "None",
+
+      // --- เปิดเฉพาะ Log ของเรา ---
+      "OnCallDurableDemo": "Information",
+      "Function.StartOnCall.User": "Information",
+      "Function.OnCallOrchestrator.User": "Information",
+      "Function.HandleOnCallResponse.User": "Information",
+      "Function.Activity_SimulateTwilioCall.User": "Information",
+      "Function.Activity_SaveOnCallSummary.User": "Information",
+      "Function.Activity_GetConfig.User": "Information"
+    },
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true,
+        "excludedTypes": "Request"
+      }
+    }
+  },
+  "extensions": {
+    "durableTask": {
+      "hubName": "OnCallHubV2"
+    }
+  }
+}
