@@ -14,7 +14,9 @@ namespace OnCallDurableDemo.Models
             {
                 Requirements = new Dictionary<string, int>
                 {
-                    { "GroupA", 2 }, { "GroupB", 2 }, { "GroupC", 1 }
+                    { "GroupA", 1 }
+                    //, { "GroupB", 2 }
+                    //, { "GroupC", 1 }
                 },
                 Steps = new List<StepRule>
                 {
@@ -26,7 +28,7 @@ namespace OnCallDurableDemo.Models
                         Actions = new List<StepAction>
                         {
                             new StepAction { Mode = "Voice", WaitTimeMinutes = 1, RepeatCount = 0 },
-                            new StepAction { Mode = "Sms", WaitTimeMinutes = 1, RepeatCount = 1 }
+                            //new StepAction { Mode = "Sms", WaitTimeMinutes = 1, RepeatCount = 1 }
                         }
                     },
                     // Step 2: Serial (Voice -> SMS)
@@ -36,8 +38,8 @@ namespace OnCallDurableDemo.Models
                         IsParallel = false,
                         Actions = new List<StepAction>
                         {
-                            new StepAction { Mode = "Voice", WaitTimeMinutes = 2, RepeatCount = 0 },
-                            new StepAction { Mode = "Sms", WaitTimeMinutes = 1, RepeatCount = 0 }
+                            new StepAction { Mode = "Voice", WaitTimeMinutes = 1, RepeatCount = 0 },
+                            //new StepAction { Mode = "Sms", WaitTimeMinutes = 1, RepeatCount = 0 }
                         }
                     }
                 }
@@ -47,8 +49,8 @@ namespace OnCallDurableDemo.Models
         public static List<UserProfile> GetAllUsers()
         {
             var users = new List<UserProfile>();
-            for (int i = 1; i <= 6; i++) users.Add(new UserProfile { Id = $"A{i}", Name = $"User A-{i}", Group = "GroupA" });
-            for (int i = 1; i <= 6; i++) users.Add(new UserProfile { Id = $"B{i}", Name = $"User B-{i}", Group = "GroupB" });
+            for (int i = 1; i <= 1; i++) users.Add(new UserProfile { Id = $"A{i}", Name = $"User A-{i}", Group = "GroupA" });
+            for (int i = 1; i <= 3; i++) users.Add(new UserProfile { Id = $"B{i}", Name = $"User B-{i}", Group = "GroupB" });
             for (int i = 1; i <= 2; i++) users.Add(new UserProfile { Id = $"C{i}", Name = $"User C-{i}", Group = "GroupC" });
             return users;
         }

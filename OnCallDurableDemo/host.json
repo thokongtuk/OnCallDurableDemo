@@ -26,7 +26,8 @@
       "Function.HandleOnCallResponse.User": "Information",
       "Function.Activity_SimulateTwilioCall.User": "Information",
       "Function.Activity_SaveOnCallSummary.User": "Information",
-      "Function.Activity_GetConfig.User": "Information"
+      "Function.Activity_GetConfig.User": "Information",
+      "Function.Activity_CallExternalApi.User": "Information"
     },
     "applicationInsights": {
       "samplingSettings": {

@@ -110,15 +110,28 @@ namespace OnCallDurableDemo.Functions
 
                             await context.CallActivityAsync("Activity_CallExternalApi", new TwilioInput() { Mode = action.Mode, UserIds = pendingUsers });
 
-
-                            // Wait
+                            // ✅ แก้ไขส่วนรอเวลา (Wait Time): รอเวลา OR รอสัญญาณ "StopWait"
                             if (action.WaitTimeMinutes > 0)
                             {
-                                logger.LogInformation($"      ⏳ Waiting {action.WaitTimeMinutes} mins...");
-                                await context.CreateTimer(context.CurrentUtcDateTime.AddMinutes(action.WaitTimeMinutes), CancellationToken.None);
+                                logger.LogInformation($"      ⏳ Waiting {action.WaitTimeMinutes} mins (Or until Mission Complete)...");
+
+                                var timerTask = context.CreateTimer(context.CurrentUtcDateTime.AddMinutes(action.WaitTimeMinutes), CancellationToken.None);
+
+                                var stopSignalTask = context.WaitForExternalEvent<object>("StopWait");
+
+                                var winner = await Task.WhenAny(timerTask, stopSignalTask);
+
+                                if (winner == stopSignalTask)
+                                {
+                                    logger.LogInformation($"      ⚡ Received 'StopWait' Signal! Skipping remaining wait time.");
+                                }
+                                else
+                                {
+                                    logger.LogInformation($"      ⏰ Timer expired.");
+                                }
                             }
                         }
-                    } // End Actions Loop
+                    } 
 
                 EndOfBatch:
                     batchRound++;
@@ -180,17 +193,24 @@ namespace OnCallDurableDemo.Functions
                 {
                     EventName = "OnCallNotification",
                     Message = "Test Initiate Call/SMS",
-                    Eesources = userPhonenumbers
+                    Resources = userPhonenumbers
                 };
+                //var requestBodyObj = new
+                //{
+                //    Name = "OnCallNotification",
+                //    Email = "test_call-out@example.com"
+                //};
 
                 if (input.Mode == "Voice")
                 {
-                    url = "https://api.twilio.com/2010-04-01/Accounts/ACXXXXXXXXXXXXXXXXX/Calls.json";
+                    url = "https://ce72aa1460b0.ngrok-free.app/api/Call/bulk-call";
+                    //url = "https://postman-echo.com/post";
                     logger.LogWarning($"      [Mock Voice] Sending to {string.Join(",", input.UserIds)}");
                 }
                 else if (input.Mode == "Sms")
                 {
-                    url = "https://api.twilio.com/2010-04-01/Accounts/ACXXXXXXXXXXXXXXXXX/Messages.json";
+                    url = "https://ce72aa1460b0.ngrok-free.app/api/Sms/send-bulk-named";
+                    //url = "https://postman-echo.com/post";
                     logger.LogWarning($"      [Mock SMS] Sending to  {string.Join(",", input.UserIds)}");
                 }
 
@@ -295,14 +315,21 @@ namespace OnCallDurableDemo.Functions
             string opId = await client.ScheduleNewOrchestrationInstanceAsync(mediatorName, input);
             var result = await client.WaitForInstanceCompletionAsync(opId, true, CancellationToken.None);
 
-            // ✅ LOG 2: ดูผลลัพธ์จาก Entity ว่าสำเร็จไหม
+            // ✅ ตรวจสอบผลลัพธ์ ถ้าเป็น MissionComplete ให้ส่งสัญญาณไปปลุก Main Orchestrator
             if (result.RuntimeStatus == OrchestrationRuntimeStatus.Completed)
             {
-                logger.LogInformation($"[Webhook] Process Result: {result.SerializedOutput}");
-            }
-            else
-            {
-                logger.LogWarning($"[Webhook] Process Status: {result.RuntimeStatus}");
+                // SerializedOutput จะเป็น JSON string เช่น "\"MissionComplete\"" หรือ "\"Success\""
+                var outputString = result.ReadOutputAs<string>(); // ใช้ Helper หรือ ToString()
+
+                logger.LogInformation($"[Webhook] Result from Entity: {outputString}");
+
+                if (outputString != null && outputString.Contains("MissionComplete"))
+                {
+                    logger.LogInformation($"[Webhook] 🚀 Mission Complete detected! Raising 'StopWait' event to Main Orchestrator ({body.InstanceId})");
+
+                    // ส่ง Event ไปที่ Main Workflow เพื่อให้หลุดจาก Timer
+                    await client.RaiseEventAsync(body.InstanceId, "StopWait", null);
+                }
             }
 
             var resp = req.CreateResponse(System.Net.HttpStatusCode.OK);

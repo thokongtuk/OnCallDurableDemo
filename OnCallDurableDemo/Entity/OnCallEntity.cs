@@ -101,6 +101,11 @@ namespace OnCallDurableDemo.Entities
             if (ActiveUsers == null) ActiveUsers = new HashSet<string>();
             if (!ActiveUsers.Contains(input.UserId)) return Task.FromResult("Error:UserNotActive");
 
+            if (AcceptedUsers.Contains(input.UserId) || DeclinedUsers.Contains(input.UserId))
+            {
+                return Task.FromResult("Error:AlreadyResponded");
+            }
+
             if (DeclinedUsers.Contains(input.UserId)) DeclinedUsers.Remove(input.UserId);
 
             if (!AcceptedUsers.Contains(input.UserId))
@@ -121,10 +126,9 @@ namespace OnCallDurableDemo.Entities
             if (ActiveUsers == null) ActiveUsers = new HashSet<string>();
             if (!ActiveUsers.Contains(input.UserId)) return Task.FromResult("Error:UserNotActive");
 
-            if (AcceptedUsers.Contains(input.UserId))
+            if (AcceptedUsers.Contains(input.UserId) || DeclinedUsers.Contains(input.UserId))
             {
-                AcceptedUsers.Remove(input.UserId);
-                if (AcceptedCount.ContainsKey(input.Group)) AcceptedCount[input.Group]--;
+                return Task.FromResult("Error:AlreadyResponded");
             }
             DeclinedUsers.Add(input.UserId);
             return Task.FromResult("Success");
