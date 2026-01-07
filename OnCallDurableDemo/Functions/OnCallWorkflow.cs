@@ -1,4 +1,4 @@
-﻿using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.DurableTask;
 using Microsoft.DurableTask.Client;
@@ -108,10 +108,8 @@ namespace OnCallDurableDemo.Functions
                             string attemptInfo = action.RepeatCount > 0 ? $"(Attempt {i + 1}/{action.RepeatCount + 1})" : "";
                             logger.LogInformation($"   👉 Action: {action.Mode} {attemptInfo} -> Sending to {pendingUsers.Count} users.");
 
-                            if (action.Mode == "Voice")
-                                await context.CallActivityAsync("Activity_SimulateTwilioCall", new { Users = pendingUsers, InstanceId = context.InstanceId });
-                            else if (action.Mode == "Sms")
-                                logger.LogWarning($"      [Mock SMS] Sending to {string.Join(",", pendingUsers)}");
+                            await context.CallActivityAsync("Activity_CallExternalApi", new TwilioInput() { Mode = action.Mode, UserIds = pendingUsers });
+
 
                             // Wait
                             if (action.WaitTimeMinutes > 0)
@@ -132,7 +130,7 @@ namespace OnCallDurableDemo.Functions
 
             } // End Steps Loop
 
-            EndOfWorkflow:
+        EndOfWorkflow:
 
             // ... (Code ส่วน Report และ Save ลง DB เหมือนเดิม) ...
             var finalState = await context.Entities.CallEntityAsync<OnCallEntity>(entityId, "GetState");
@@ -154,7 +152,89 @@ namespace OnCallDurableDemo.Functions
             var logger = ctx.GetLogger("Twilio");
             // ปรับ input ให้รับ dynamic หรือ object เพื่อความง่าย
             logger.LogWarning($"[Twilio] Simulating calls... (Wait 2s)");
+
             await Task.Delay(2000);
+        }
+
+        [Function("Activity_CallExternalApi")]
+        public static async Task<string> CallExternalApi([ActivityTrigger] TwilioInput input, FunctionContext ctx)
+        {
+            var logger = ctx.GetLogger("ApiCall");
+
+            using var httpClient = new HttpClient();
+
+            try
+            {
+                string url = "";
+                int timeoutSeconds = 30;
+                var userPhonenumbers = input.UserIds.Select(u =>
+                new UserPhoneNumber
+                {
+                    User = u,
+                    Phone = UserInfo.UserPhoneNumber.ContainsKey(u) ? UserInfo.UserPhoneNumber[u] : ""
+                }).ToList();
+
+                httpClient.Timeout = TimeSpan.FromSeconds(timeoutSeconds);
+
+                var requestBodyObj = new
+                {
+                    EventName = "OnCallNotification",
+                    Message = "Test Initiate Call/SMS",
+                    Eesources = userPhonenumbers
+                };
+
+                if (input.Mode == "Voice")
+                {
+                    url = "https://api.twilio.com/2010-04-01/Accounts/ACXXXXXXXXXXXXXXXXX/Calls.json";
+                    logger.LogWarning($"      [Mock Voice] Sending to {string.Join(",", input.UserIds)}");
+                }
+                else if (input.Mode == "Sms")
+                {
+                    url = "https://api.twilio.com/2010-04-01/Accounts/ACXXXXXXXXXXXXXXXXX/Messages.json";
+                    logger.LogWarning($"      [Mock SMS] Sending to  {string.Join(",", input.UserIds)}");
+                }
+
+                var requestBody = System.Text.Json.JsonSerializer.Serialize(requestBodyObj);
+
+                // Only POST method
+                var content = new StringContent(requestBody, System.Text.Encoding.UTF8, "application/json");
+                var response = await httpClient.PostAsync(url, content);
+                var responseContent = await response.Content.ReadAsStringAsync();
+
+                if (response.IsSuccessStatusCode)
+                {
+                    logger.LogInformation($"[API] Successfully called {url} - Status: {response.StatusCode}");
+                    return responseContent;
+                }
+                else
+                {
+                    logger.LogError($"[API] Failed to call {url} - Status: {response.StatusCode}, Response: {responseContent}");
+
+                    // Fallback for Twilio calls
+                    if (url.Contains("twilio.com"))
+                    {
+                        logger.LogError($"[Twilio] API call failed, falling back to simulation");
+                        await Task.Delay(2000);
+                        return "Fallback: Simulated calls";
+                    }
+
+                    throw new HttpRequestException($"API call failed with status {response.StatusCode}: {responseContent}");
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"[API] Exception during POST request: {ex.Message}");
+
+                // Fallback for Twilio calls
+                if (ex.Message.Contains("twilio") || ctx.GetLogger("TwilioApi") == logger)
+                {
+                    logger.LogError($"[Twilio] Exception occurred, falling back to simulation: {ex.Message}");
+                    await Task.Delay(2000);
+                    return "Fallback: Simulated calls";
+                }
+
+                throw;
+            }
         }
 
         [Function("Activity_SaveOnCallSummary")]
