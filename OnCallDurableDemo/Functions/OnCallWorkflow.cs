@@ -1,3 +1,4 @@
+using DurableTask.Core.Entities;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.DurableTask;
@@ -28,9 +29,6 @@ namespace OnCallDurableDemo.Functions
             return starter.CreateCheckStatusResponse(req, instanceId);
         }
 
-        // ------------------------------------------------------------------
-        // 2. ORCHESTRATOR
-        // ------------------------------------------------------------------
         [Function("OnCallOrchestrator")]
         public static async Task RunOrchestrator([OrchestrationTrigger] TaskOrchestrationContext context)
         {
@@ -43,24 +41,24 @@ namespace OnCallDurableDemo.Functions
             bool isMissionSuccess = false;
             string endReason = "Workflow Finished";
 
-            // ================= LOOP STEPS (Step 1 -> Step 2) =================
+            // ==================================================================================
+            // 🎯 GLOBAL STOP LISTENER: ประกาศตัวแปรรอรับสัญญาณไว้นอก Loop (ระดับ Step)
+            // ==================================================================================
+            // สร้าง Task รอรับ Event "StopWait" เตรียมไว้ก่อนเลย
+            var globalStopSignalTask = context.WaitForExternalEvent<string>("StopWait");
+
             foreach (var step in config.Steps.OrderBy(s => s.StepNumber))
             {
                 if (isMissionSuccess) break;
 
-                logger.LogInformation($"\u001b[35m===== STARTING STEP {step.StepNumber} ({(step.IsParallel ? "Parallel" : "Serial")}) =====\u001b[0m");
+                logger.LogInformation($"\u001b[35m===== STARTING STEP {step.StepNumber} =====\u001b[0m");
 
-                // ล้างความจำ CalledUsers เฉพาะตอน "ขึ้น Step ใหม่" เท่านั้น
-                // เพื่อให้ Step 2 สามารถโทรหาคนที่ Step 1 เคยโทรไปแล้วได้ (ถ้า Business ต้องการแบบนั้น)
-                // แต่ถ้าอยากให้คนที่เคยโทรแล้วใน Step 1 ไม่ถูกโทรซ้ำใน Step 2 ให้ลบบรรทัดนี้ออกครับ
                 await context.Entities.CallEntityAsync(entityId, "ResetStepMemory");
 
-                // ================= REPLENISHMENT LOOP (วนลูปเติมคนจนกว่าจะครบ) =================
-                // 🆕 นี่คือส่วนที่เพิ่มเข้ามาครับ เพื่อแก้ปัญหา "ทำรอบเดียวแล้วหนีไปเลย"
                 int batchRound = 1;
-                while (true)
+                while (true) // --- BATCH LOOP ---
                 {
-                    // 1. เช็คก่อนว่าครบหรือยัง ถ้าครบแล้ว Break ออกจาก Step นี้เลย
+                    // 1. Check Quota (เช็คก่อนเริ่ม)
                     var currentState = await context.Entities.CallEntityAsync<OnCallEntity>(entityId, "GetState");
                     LogCurrentStatus(logger, currentState);
 
@@ -71,81 +69,107 @@ namespace OnCallDurableDemo.Functions
                         goto EndOfWorkflow;
                     }
 
-                    // 2. ดึงคนมา 1 Batch (ตาม Logic: Parallel=ดึงจนเต็ม Need, Serial=ดึง 1)
-                    // คนที่เคยถูกเรียกใน Batch ก่อนหน้า (CalledUsers) จะไม่ถูกดึงซ้ำใน Step นี้
+                    // 2. Get Users
                     var usersInBatch = await context.Entities.CallEntityAsync<List<string>>(entityId, "GetBatchUsers", step.IsParallel);
-
                     if (usersInBatch.Count == 0)
                     {
-                        logger.LogWarning($"[Step {step.StepNumber}] No more candidates available in DB. Moving to next step.");
-                        break; // หมดคนให้เรียกใน Step นี้แล้ว -> ข้ามไป Step ถัดไป
+                        logger.LogWarning($"[Step {step.StepNumber}] No more candidates. Next step.");
+                        break;
                     }
+                    logger.LogInformation($"--- [Step {step.StepNumber} | Batch {batchRound}] ---");
 
-                    logger.LogInformation($"--- [Step {step.StepNumber} | Batch {batchRound}] Processing Users: {string.Join(", ", usersInBatch)} ---");
-
-                    // ================= LOOP ACTIONS (Call -> Text) =================
-                    foreach (var action in step.Actions)
+                    foreach (var action in step.Actions) // --- ACTION LOOP ---
                     {
                         if (isMissionSuccess) break;
 
-                        // ================= LOOP REPEAT (Retry Action) =================
-                        for (int i = 0; i <= action.RepeatCount; i++)
+                        for (int i = 0; i <= action.RepeatCount; i++) // --- RETRY LOOP ---
                         {
-                            // เช็คจบงานทุกครั้งก่อนทำ Action เผื่อมีคนตอบเข้ามาระหว่างรอ
+                            // Double Check
                             bool isComplete = await context.Entities.CallEntityAsync<bool>(entityId, "IsMissionComplete");
                             if (isComplete) { isMissionSuccess = true; endReason = "Mission Complete"; goto EndOfWorkflow; }
 
-                            // 🔍 Filter: ตัดคนที่ตอบแล้ว (Accepted/Declined) ออกจาก Batch นี้
                             var pendingUsers = await context.Entities.CallEntityAsync<List<string>>(entityId, "FilterPendingUsers", usersInBatch);
+                            if (pendingUsers.Count == 0) { goto EndOfBatch; }
 
-                            if (pendingUsers.Count == 0)
-                            {
-                                logger.LogInformation($"   ✅ All users in this batch responded. Stop processing actions for this batch.");
-                                goto EndOfBatch; // กระโดดไปจบ Batch นี้ เพื่อไปดึงคนใหม่ (Replenish)
-                            }
-
-                            // Execute Action
+                            // Execute Activity
                             string attemptInfo = action.RepeatCount > 0 ? $"(Attempt {i + 1}/{action.RepeatCount + 1})" : "";
-                            logger.LogInformation($"   👉 Action: {action.Mode} {attemptInfo} -> Sending to {pendingUsers.Count} users.");
+                            logger.LogInformation($"   👉 Action: {action.Mode} {attemptInfo} -> Sending... | Processing: {string.Join(", ", pendingUsers)}");
 
-                            await context.CallActivityAsync("Activity_CallExternalApi", new TwilioInput() { Mode = action.Mode, UserIds = pendingUsers });
+                            // ✅ ใช้ InstanceId ปกติ (ไม่ต้อง Dynamic)
+                            await context.CallActivityAsync("Activity_SimulateTwilioCall", new TwilioInput()
+                            {
+                                Mode = action.Mode,
+                                UserIds = pendingUsers,
+                                InstanceId = context.InstanceId
+                            });
 
-                            // ✅ แก้ไขส่วนรอเวลา (Wait Time): รอเวลา OR รอสัญญาณ "StopWait"
+                            // ---------------------------------------------------------------
+                            // 🔥 WAIT LOGIC (ใช้ Global Listener)
+                            // ---------------------------------------------------------------
                             if (action.WaitTimeMinutes > 0)
                             {
-                                logger.LogInformation($"      ⏳ Waiting {action.WaitTimeMinutes} mins (Or until Mission Complete)...");
+                                var waitStartTime = context.CurrentUtcDateTime;
+                                var expiryTime = context.CurrentUtcDateTime.AddMinutes(action.WaitTimeMinutes);
+                                logger.LogInformation($"\n      ⏳ Waiting {action.WaitTimeMinutes} mins (Using Global Listener)...");
 
-                                var timerTask = context.CreateTimer(context.CurrentUtcDateTime.AddMinutes(action.WaitTimeMinutes), CancellationToken.None);
+                                // สร้าง Timer เฉพาะกิจสำหรับรอบนี้
+                                using var cts = new CancellationTokenSource();
+                                var timerTask = context.CreateTimer(expiryTime, CancellationToken.None);
 
-                                var stopSignalTask = context.WaitForExternalEvent<object>("StopWait");
+                                // 🏁 RACE: แข่งกันระหว่าง "Timer ของรอบนี้" vs "Stop Signal ที่รอมาตั้งแต่ต้น"
+                                var winner = await Task.WhenAny(timerTask, globalStopSignalTask);
 
-                                var winner = await Task.WhenAny(timerTask, stopSignalTask);
-
-                                if (winner == stopSignalTask)
+                                if (winner == globalStopSignalTask)
                                 {
-                                    logger.LogInformation($"      ⚡ Received 'StopWait' Signal! Skipping remaining wait time.");
+                                    // 🛑 ได้รับสัญญาณ STOP! (ไม่ว่าจะมาจาก Batch ไหนก็ตาม)
+                                    // เนื่องจาก Task นี้ถูกประกาศไว้นอก Loop มันจึงรับสัญญาณได้ตลอดเวลา
+
+                                    bool isReallyComplete = await context.Entities.CallEntityAsync<bool>(entityId, "IsMissionComplete");
+                                    if (isReallyComplete)
+                                    {
+                                        var timeSpent = context.CurrentUtcDateTime - waitStartTime;
+                                        logger.LogInformation($"      ⚡ STOP Verified! (Waited: {timeSpent.TotalSeconds:F2}s). Closing Job.");
+
+                                        cts.Cancel(); // ฆ่า Timer ทิ้ง
+                                        isMissionSuccess = true;
+                                        goto EndOfWorkflow;
+                                    }
+                                    else
+                                    {
+                                        // ⚠️ สัญญาณหลอก (False Alarm) หรือ สัญญาณเก่า
+                                        logger.LogWarning($"      ⚠️ Signal received but job NOT complete. Resetting Listener...");
+
+                                        // Reset Listener: สร้างตัวรอรับใหม่ เพื่อรอสัญญาณครั้งถัดไป
+                                        // (เพราะตัวเก่า Completed ไปแล้ว เราต้องสร้างใหม่เพื่อให้รอต่อได้)
+                                        globalStopSignalTask = context.WaitForExternalEvent<string>("StopWait");
+
+                                        // ❗ สำคัญ: เราไม่ Break Loop ตรงนี้ แต่เราจะวนกลับไปเช็ค Timer ต่อ
+                                        // ในทางปฏิบัติ การเรียก WhenAny ใหม่กับ Timer เดิมที่ยังไม่หมดเวลา ทำได้เลย
+                                        // แต่เพื่อความง่าย เราจะข้ามไปรอบถัดไปเลยก็ได้ หรือจะรอ Timer ต่อก็ได้
+                                        // ในที่นี้ขอเลือก "รอจน Timer หมด" เพื่อความชัวร์
+                                        await timerTask;
+                                        logger.LogInformation($"      ⏰ Timer expired (after false alarm).");
+                                    }
                                 }
                                 else
                                 {
+                                    // ⏰ Timer ชนะ (หมดเวลา)
+                                    // สังเกตว่าเรา *ไม่* Cancel globalStopSignalTask เพราะเราจะใช้มันต่อใน Batch หน้า!
                                     logger.LogInformation($"      ⏰ Timer expired.");
                                 }
                             }
+                            // ---------------------------------------------------------------
                         }
-                    } 
+                    }
 
-                EndOfBatch:
+                    EndOfBatch:
                     batchRound++;
-                    // วนกลับไป while(true) ด้านบน -> เพื่อเช็ค Quota และดึงคนชุดใหม่ (B3, A3) มาทำต่อ
-
-                } // End Replenishment Loop
+                } // End Batch Loop
 
                 logger.LogInformation($"[Step {step.StepNumber}] Step Finished.");
+            } // End Step Loop
 
-            } // End Steps Loop
-
-        EndOfWorkflow:
-
-            // ... (Code ส่วน Report และ Save ลง DB เหมือนเดิม) ...
+            EndOfWorkflow:
             var finalState = await context.Entities.CallEntityAsync<OnCallEntity>(entityId, "GetState");
             GenerateFinalReport(logger, finalState, isMissionSuccess, endReason);
 
@@ -187,6 +211,12 @@ namespace OnCallDurableDemo.Functions
                     Phone = UserInfo.UserPhoneNumber.ContainsKey(u) ? UserInfo.UserPhoneNumber[u] : ""
                 }).ToList();
 
+                logger.LogInformation($"\u001b[33m      📞 [Dispatch] Mode: {input.Mode} | Count: {userPhonenumbers.Count} Targets:\u001b[0m");
+                foreach (var x in userPhonenumbers)
+                {
+                    // สั่ง Log แยกคำสั่งกัน บรรทัดใครบรรทัดมัน
+                    logger.LogInformation($"\u001b[33m         ➡️  {x.User} [{x.Phone}]\u001b[0m");
+                }
                 httpClient.Timeout = TimeSpan.FromSeconds(timeoutSeconds);
 
                 var requestBodyObj = new
@@ -318,17 +348,19 @@ namespace OnCallDurableDemo.Functions
             // ✅ ตรวจสอบผลลัพธ์ ถ้าเป็น MissionComplete ให้ส่งสัญญาณไปปลุก Main Orchestrator
             if (result.RuntimeStatus == OrchestrationRuntimeStatus.Completed)
             {
-                // SerializedOutput จะเป็น JSON string เช่น "\"MissionComplete\"" หรือ "\"Success\""
-                var outputString = result.ReadOutputAs<string>(); // ใช้ Helper หรือ ToString()
+                var outputString = result.ReadOutputAs<string>();
 
-                logger.LogInformation($"[Webhook] Result from Entity: {outputString}");
+                // Log Result Color
+                if (outputString != null && outputString.StartsWith("Error"))
+                    logger.LogInformation($"\u001b[31m[Webhook] Result from Entity: {outputString}\u001b[0m");
+                else
+                    logger.LogInformation($"\u001b[32m[Webhook] Result from Entity: {outputString}\u001b[0m");
 
+                // ✅ CLEAN LOGIC: ถ้า Entity บอกว่าครบ -> ส่ง "StopWait" ไปบอก Orchestrator
                 if (outputString != null && outputString.Contains("MissionComplete"))
                 {
-                    logger.LogInformation($"[Webhook] 🚀 Mission Complete detected! Raising 'StopWait' event to Main Orchestrator ({body.InstanceId})");
-
-                    // ส่ง Event ไปที่ Main Workflow เพื่อให้หลุดจาก Timer
-                    await client.RaiseEventAsync(body.InstanceId, "StopWait", null);
+                    logger.LogInformation($"[Webhook] 🚀 Mission Complete! Raising 'StopWait' to {body.InstanceId}");
+                    await client.RaiseEventAsync(body.InstanceId, "StopWait", "STOP");
                 }
             }
 

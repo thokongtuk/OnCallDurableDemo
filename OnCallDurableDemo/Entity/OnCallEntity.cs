@@ -17,12 +17,12 @@ namespace OnCallDurableDemo.Entities
         public Dictionary<string, int> AcceptedCount { get; set; } = new Dictionary<string, int>();
         [JsonProperty("called")] 
         public HashSet<string> CalledUsers { get; set; } = new HashSet<string>();
+        [JsonProperty("currentBatchUsers")]
+        public HashSet<string> CurrentBatchUsers { get; set; } = new HashSet<string>();
         [JsonProperty("acceptedUsers")] 
         public HashSet<string> AcceptedUsers { get; set; } = new HashSet<string>();
         [JsonProperty("declinedUsers")] 
         public HashSet<string> DeclinedUsers { get; set; } = new HashSet<string>();
-        [JsonProperty("activeUsers")] 
-        public HashSet<string> ActiveUsers { get; set; } = new HashSet<string>();
 
         // --- Init & Reset ---
         public void Initialize(Dictionary<string, int> req)
@@ -32,24 +32,26 @@ namespace OnCallDurableDemo.Entities
             CalledUsers = new HashSet<string>();
             AcceptedUsers = new HashSet<string>();
             DeclinedUsers = new HashSet<string>();
-            ActiveUsers = new HashSet<string>();
+            CurrentBatchUsers = new HashSet<string>();
         }
 
         public void ResetStepMemory()
         {
             CalledUsers.Clear();
-            ActiveUsers.Clear();
+            CurrentBatchUsers.Clear();
         }
 
         public void Delete()
         {
             Requirements = null; AcceptedCount = null; CalledUsers = null;
-            AcceptedUsers = null; DeclinedUsers = null; ActiveUsers = null;
+            AcceptedUsers = null; DeclinedUsers = null; CurrentBatchUsers = null;
         }
 
         // --- Core Logic ---
         public List<string> GetBatchUsers(bool isParallel)
         {
+            CurrentBatchUsers.Clear();
+
             var allUsers = MockRepository.GetAllUsers();
             var batch = new List<string>();
 
@@ -76,7 +78,7 @@ namespace OnCallDurableDemo.Entities
                 {
                     batch.Add(uid);
                     CalledUsers.Add(uid);
-                    ActiveUsers.Add(uid);
+                    CurrentBatchUsers.Add(uid);
                 }
             }
             return batch;
@@ -98,8 +100,10 @@ namespace OnCallDurableDemo.Entities
         // --- User Interaction ---
         public Task<string> UserAccepted(UserAcceptInput input)
         {
-            if (ActiveUsers == null) ActiveUsers = new HashSet<string>();
-            if (!ActiveUsers.Contains(input.UserId)) return Task.FromResult("Error:UserNotActive");
+            if (!CurrentBatchUsers.Contains(input.UserId))
+            {
+                return Task.FromResult("Error:ResponseExpired (Not in current batch)");
+            }
 
             if (AcceptedUsers.Contains(input.UserId) || DeclinedUsers.Contains(input.UserId))
             {
@@ -123,8 +127,10 @@ namespace OnCallDurableDemo.Entities
 
         public Task<string> UserDeclined(UserAcceptInput input)
         {
-            if (ActiveUsers == null) ActiveUsers = new HashSet<string>();
-            if (!ActiveUsers.Contains(input.UserId)) return Task.FromResult("Error:UserNotActive");
+            if (!CurrentBatchUsers.Contains(input.UserId))
+            {
+                return Task.FromResult("Error:ResponseExpired (Not in current batch)");
+            }
 
             if (AcceptedUsers.Contains(input.UserId) || DeclinedUsers.Contains(input.UserId))
             {
