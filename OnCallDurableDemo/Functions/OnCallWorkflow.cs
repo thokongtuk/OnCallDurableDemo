@@ -41,61 +41,74 @@ namespace OnCallDurableDemo.Functions
             bool isMissionSuccess = false;
             string endReason = "Workflow Finished";
 
-            // ==================================================================================
-            // 🎯 GLOBAL STOP LISTENER: ประกาศตัวแปรรอรับสัญญาณไว้นอก Loop (ระดับ Step)
-            // ==================================================================================
-            // สร้าง Task รอรับ Event "StopWait" เตรียมไว้ก่อนเลย
+            // 🎯 GLOBAL LISTENER
             var globalStopSignalTask = context.WaitForExternalEvent<string>("StopWait");
 
+            // ================= STEP LOOP =================
             foreach (var step in config.Steps.OrderBy(s => s.StepNumber))
             {
                 if (isMissionSuccess) break;
-
                 logger.LogInformation($"\u001b[35m===== STARTING STEP {step.StepNumber} =====\u001b[0m");
 
-                await context.Entities.CallEntityAsync(entityId, "ResetStepMemory");
-
-                int batchRound = 1;
-                while (true) // --- BATCH LOOP ---
+                // ================= ACTION LOOP =================
+                foreach (var action in step.Actions)
                 {
-                    // 1. Check Quota (เช็คก่อนเริ่ม)
-                    var currentState = await context.Entities.CallEntityAsync<OnCallEntity>(entityId, "GetState");
-                    LogCurrentStatus(logger, currentState);
+                    if (isMissionSuccess) break;
+                    logger.LogInformation($"\u001b[33m--- Starting Action Mode: {action.Mode} ---\u001b[0m");
 
-                    if (IsMissionComplete(currentState))
-                    {
-                        isMissionSuccess = true;
-                        endReason = "Mission Complete";
-                        goto EndOfWorkflow;
-                    }
-
-                    // 2. Get Users
-                    var usersInBatch = await context.Entities.CallEntityAsync<List<string>>(entityId, "GetBatchUsers", step.IsParallel);
-                    if (usersInBatch.Count == 0)
-                    {
-                        logger.LogWarning($"[Step {step.StepNumber}] No more candidates. Next step.");
-                        break;
-                    }
-                    logger.LogInformation($"--- [Step {step.StepNumber} | Batch {batchRound}] ---");
-
-                    foreach (var action in step.Actions) // --- ACTION LOOP ---
+                    // ================= 🔄 ATTEMPT LOOP (RETRY) =================
+                    for (int attempt = 0; attempt <= action.RepeatCount; attempt++)
                     {
                         if (isMissionSuccess) break;
 
-                        for (int i = 0; i <= action.RepeatCount; i++) // --- RETRY LOOP ---
-                        {
-                            // Double Check
-                            bool isComplete = await context.Entities.CallEntityAsync<bool>(entityId, "IsMissionComplete");
-                            if (isComplete) { isMissionSuccess = true; endReason = "Mission Complete"; goto EndOfWorkflow; }
+                        string attemptLog = action.RepeatCount > 0 ? $"(Attempt {attempt + 1}/{action.RepeatCount + 1})" : "";
+                        logger.LogInformation($"\u001b[36m>>> Starting Cycle: {action.Mode} {attemptLog}\u001b[0m");
 
+                        // ❗ Reset Memory ที่นี่! 
+                        // เพื่อให้ในรอบ Repeat (Attempt 2) ระบบจะ "ลืม" ว่าเคยดึง A1-A4 ไปแล้ว
+                        // และยอมดึง A1-A4 ออกมาให้เราโทรซ้ำอีกรอบ
+                        await context.Entities.CallEntityAsync(entityId, "ResetStepMemory");
+
+                        int batchRound = 1;
+
+                        // ================= BATCH LOOP (Inside Attempt) =================
+                        while (true)
+                        {
+                            // 1. Check Quota
+                            var currentState = await context.Entities.CallEntityAsync<OnCallEntity>(entityId, "GetState");
+                            LogCurrentStatus(logger, currentState);
+
+                            if (IsMissionComplete(currentState))
+                            {
+                                isMissionSuccess = true;
+                                endReason = "Mission Complete";
+                                goto EndOfWorkflow;
+                            }
+
+                            // 2. Get Users (จะดึงคนเดิมได้ เพราะเรา ResetStepMemory แล้วข้างบน)
+                            var usersInBatch = await context.Entities.CallEntityAsync<List<string>>(entityId, "GetBatchUsers", step.IsParallel);
+
+                            if (usersInBatch.Count == 0)
+                            {
+                                // หมดคนในรอบนี้แล้ว (ครบ A1..A5 แล้ว) -> จบ Batch Loop เพื่อไปเริ่ม Attempt ถัดไป (ถ้ามี)
+                                logger.LogInformation($"   [Cycle Finished] No more candidates for {action.Mode} {attemptLog}.");
+                                break;
+                            }
+
+                            logger.LogInformation($"   [Batch {batchRound}] Processing: {string.Join(", ", usersInBatch)}");
+
+                            // Filter Pending (ใครที่รับงานไปแล้ว จะถูกตัดออกที่นี่)
                             var pendingUsers = await context.Entities.CallEntityAsync<List<string>>(entityId, "FilterPendingUsers", usersInBatch);
-                            if (pendingUsers.Count == 0) { goto EndOfBatch; }
+
+                            if (pendingUsers.Count == 0)
+                            {
+                                logger.LogInformation($"   ✅ Batch {batchRound} fully responded. Next Batch.");
+                                batchRound++;
+                                continue; // ไป Batch ถัดไป
+                            }
 
                             // Execute Activity
-                            string attemptInfo = action.RepeatCount > 0 ? $"(Attempt {i + 1}/{action.RepeatCount + 1})" : "";
-                            logger.LogInformation($"   👉 Action: {action.Mode} {attemptInfo} -> Sending... | Processing: {string.Join(", ", pendingUsers)}");
-
-                            // ✅ ใช้ InstanceId ปกติ (ไม่ต้อง Dynamic)
+                            logger.LogInformation($"      👉 Sending {action.Mode} {attemptLog} to {pendingUsers.Count} users...");
                             await context.CallActivityAsync("Activity_SimulateTwilioCall", new TwilioInput()
                             {
                                 Mode = action.Mode,
@@ -103,76 +116,57 @@ namespace OnCallDurableDemo.Functions
                                 InstanceId = context.InstanceId
                             });
 
-                            // ---------------------------------------------------------------
-                            // 🔥 WAIT LOGIC (ใช้ Global Listener)
-                            // ---------------------------------------------------------------
+                            // --- WAIT LOGIC ---
                             if (action.WaitTimeMinutes > 0)
                             {
                                 var waitStartTime = context.CurrentUtcDateTime;
                                 var expiryTime = context.CurrentUtcDateTime.AddMinutes(action.WaitTimeMinutes);
-                                logger.LogInformation($"\n      ⏳ Waiting {action.WaitTimeMinutes} mins (Using Global Listener)...");
+                                logger.LogInformation($"         ⏳ Waiting {action.WaitTimeMinutes} mins...");
 
-                                // สร้าง Timer เฉพาะกิจสำหรับรอบนี้
                                 using var cts = new CancellationTokenSource();
                                 var timerTask = context.CreateTimer(expiryTime, CancellationToken.None);
 
-                                // 🏁 RACE: แข่งกันระหว่าง "Timer ของรอบนี้" vs "Stop Signal ที่รอมาตั้งแต่ต้น"
                                 var winner = await Task.WhenAny(timerTask, globalStopSignalTask);
 
                                 if (winner == globalStopSignalTask)
                                 {
-                                    // 🛑 ได้รับสัญญาณ STOP! (ไม่ว่าจะมาจาก Batch ไหนก็ตาม)
-                                    // เนื่องจาก Task นี้ถูกประกาศไว้นอก Loop มันจึงรับสัญญาณได้ตลอดเวลา
-
                                     bool isReallyComplete = await context.Entities.CallEntityAsync<bool>(entityId, "IsMissionComplete");
                                     if (isReallyComplete)
                                     {
-                                        var timeSpent = context.CurrentUtcDateTime - waitStartTime;
-                                        logger.LogInformation($"      ⚡ STOP Verified! (Waited: {timeSpent.TotalSeconds:F2}s). Closing Job.");
-
-                                        cts.Cancel(); // ฆ่า Timer ทิ้ง
+                                        logger.LogInformation($"         ⚡ STOP Verified! Closing Job.");
+                                        cts.Cancel();
                                         isMissionSuccess = true;
                                         goto EndOfWorkflow;
                                     }
                                     else
                                     {
-                                        // ⚠️ สัญญาณหลอก (False Alarm) หรือ สัญญาณเก่า
-                                        logger.LogWarning($"      ⚠️ Signal received but job NOT complete. Resetting Listener...");
-
-                                        // Reset Listener: สร้างตัวรอรับใหม่ เพื่อรอสัญญาณครั้งถัดไป
-                                        // (เพราะตัวเก่า Completed ไปแล้ว เราต้องสร้างใหม่เพื่อให้รอต่อได้)
+                                        logger.LogWarning($"         ⚠️ Signal received but not complete. Waiting timer...");
                                         globalStopSignalTask = context.WaitForExternalEvent<string>("StopWait");
-
-                                        // ❗ สำคัญ: เราไม่ Break Loop ตรงนี้ แต่เราจะวนกลับไปเช็ค Timer ต่อ
-                                        // ในทางปฏิบัติ การเรียก WhenAny ใหม่กับ Timer เดิมที่ยังไม่หมดเวลา ทำได้เลย
-                                        // แต่เพื่อความง่าย เราจะข้ามไปรอบถัดไปเลยก็ได้ หรือจะรอ Timer ต่อก็ได้
-                                        // ในที่นี้ขอเลือก "รอจน Timer หมด" เพื่อความชัวร์
                                         await timerTask;
-                                        logger.LogInformation($"      ⏰ Timer expired (after false alarm).");
                                     }
                                 }
                                 else
                                 {
-                                    // ⏰ Timer ชนะ (หมดเวลา)
-                                    // สังเกตว่าเรา *ไม่* Cancel globalStopSignalTask เพราะเราจะใช้มันต่อใน Batch หน้า!
-                                    logger.LogInformation($"      ⏰ Timer expired.");
+                                    logger.LogInformation($"         ⏰ Timer expired.");
                                 }
                             }
-                            // ---------------------------------------------------------------
-                        }
-                    }
+                            // ------------------
 
-                    EndOfBatch:
-                    batchRound++;
-                } // End Batch Loop
+                            batchRound++;
 
-                logger.LogInformation($"[Step {step.StepNumber}] Step Finished.");
+                        } // End Batch Loop (While True)
+
+                    } // End Attempt Loop
+
+                } // End Action Loop
+
+                logger.LogInformation($"[Step {step.StepNumber}] All Actions Finished.");
+
             } // End Step Loop
 
             EndOfWorkflow:
             var finalState = await context.Entities.CallEntityAsync<OnCallEntity>(entityId, "GetState");
             GenerateFinalReport(logger, finalState, isMissionSuccess, endReason);
-
             await context.CallActivityAsync("Activity_SaveOnCallSummary", new { Status = isMissionSuccess ? "Success" : "Failed", Reason = endReason });
             await context.Entities.SignalEntityAsync(entityId, "Delete", null);
         }
@@ -294,7 +288,7 @@ namespace OnCallDurableDemo.Functions
         }
 
         // ------------------------------------------------------------------
-        // 4. WEBHOOK & MEDIATOR
+        // 4. WEBHOOK & MEDIATOR (COMPLETE VERSION)
         // ------------------------------------------------------------------
         [Function("HandleOnCallResponse")]
         public static async Task<HttpResponseData> Webhook(
@@ -302,38 +296,50 @@ namespace OnCallDurableDemo.Functions
             [DurableClient] DurableTaskClient client,
             FunctionContext ctx)
         {
-            var logger = ctx.GetLogger("Webhook"); // ✅ เพิ่ม Logger
+            var logger = ctx.GetLogger("Webhook");
 
             var body = await req.ReadFromJsonAsync<WebhookRequest>();
             if (body == null) return req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
 
-            // ✅ LOG 1: รับ Request เข้ามา ดูทันทีว่าส่งอะไรมา สถานะคืออะไร
-            string statusText = body.Status == 1 ? "Available (Accepted)" : "Unavailable (Declined)";
-            logger.LogInformation($"\u001b[36m[Webhook] Received for User: {body.UserId} | Status: {statusText} ({body.Status})\u001b[0m");
+            // =================================================================================
+            // 🎨 LOG 1: Status Color Logic (เขียว/แดง เฉพาะคำ)
+            // =================================================================================
+            string statusWithColor;
+            if (body.Status == 1)
+            {
+                // \u001b[32m = เขียว, \u001b[36m = ฟ้า (สี Base ของบรรทัดนี้)
+                statusWithColor = "\u001b[32mAvailable\u001b[36m (Accepted)";
+            }
+            else
+            {
+                // \u001b[31m = แดง, \u001b[36m = ฟ้า
+                statusWithColor = "\u001b[31mUnavailable\u001b[36m (Declined)";
+            }
 
-            // -----------------------------------------------------------
-            // 🔧 FIX BUG: ระบุ Group ให้ถูกต้อง (รองรับ A, B และ C)
-            // -----------------------------------------------------------
+            // Log เป็นสีฟ้า (Cyan) ทั้งบรรทัด แต่คำสถานะจะเด้งสีตาม Logic ด้านบน
+            logger.LogInformation($"\u001b[36m[Webhook] Received for User: {body.UserId} | Status: {statusWithColor} ({body.Status})\u001b[0m");
+
+            // =================================================================================
+            // 🧩 GROUP MAPPING LOGIC
+            // =================================================================================
             string group = "Unknown";
             if (body.UserId.StartsWith("A")) group = "GroupA";
             else if (body.UserId.StartsWith("B")) group = "GroupB";
             else if (body.UserId.StartsWith("C")) group = "GroupC";
 
-            // Log เตือนถ้าหากลุ่มไม่เจอ
             if (group == "Unknown")
             {
                 logger.LogError($"[Webhook] Error: Could not determine group for User {body.UserId}");
-                // อาจจะ return bad request หรือให้ process ต่อแล้วแต่ business logic
             }
             else
             {
                 logger.LogInformation($"[Webhook] User {body.UserId} mapped to group: {group}");
             }
-            // -----------------------------------------------------------
 
+            // =================================================================================
+            // 🔄 CALL MEDIATOR (ENTITY INTERACTION)
+            // =================================================================================
             var mediatorName = body.Status == 1 ? "UserAcceptOrchestrator" : "UserDeclineOrchestrator";
-
-            // ใส่ Group ที่ถูกต้องเข้าไปใน Input
             var input = new UserAcceptInput
             {
                 Group = group,
@@ -341,26 +347,43 @@ namespace OnCallDurableDemo.Functions
                 MainInstanceId = body.InstanceId
             };
 
-            // ... (ส่วนการเรียก Orchestrator เหมือนเดิม) ...
             string opId = await client.ScheduleNewOrchestrationInstanceAsync(mediatorName, input);
+
+            // รอผลลัพธ์จาก Mediator (Entity update)
             var result = await client.WaitForInstanceCompletionAsync(opId, true, CancellationToken.None);
 
-            // ✅ ตรวจสอบผลลัพธ์ ถ้าเป็น MissionComplete ให้ส่งสัญญาณไปปลุก Main Orchestrator
             if (result.RuntimeStatus == OrchestrationRuntimeStatus.Completed)
             {
                 var outputString = result.ReadOutputAs<string>();
 
-                // Log Result Color
+                // Log Result Color (เขียว/แดง ตามผลลัพธ์ Entity)
                 if (outputString != null && outputString.StartsWith("Error"))
                     logger.LogInformation($"\u001b[31m[Webhook] Result from Entity: {outputString}\u001b[0m");
                 else
                     logger.LogInformation($"\u001b[32m[Webhook] Result from Entity: {outputString}\u001b[0m");
 
-                // ✅ CLEAN LOGIC: ถ้า Entity บอกว่าครบ -> ส่ง "StopWait" ไปบอก Orchestrator
+                // =================================================================================
+                // 🚀 STOP SIGNAL LOGIC (WITH SAFE GUARD)
+                // =================================================================================
                 if (outputString != null && outputString.Contains("MissionComplete"))
                 {
-                    logger.LogInformation($"[Webhook] 🚀 Mission Complete! Raising 'StopWait' to {body.InstanceId}");
-                    await client.RaiseEventAsync(body.InstanceId, "StopWait", "STOP");
+                    logger.LogInformation($"[Webhook] 🚀 Mission Complete detected! Raising 'StopWait' to {body.InstanceId}");
+
+                    try
+                    {
+                        // ส่ง Event มาตรฐาน "StopWait" ไปบอก Orchestrator หลัก
+                        await client.RaiseEventAsync(body.InstanceId, "StopWait", "STOP");
+                    }
+                    catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.FailedPrecondition)
+                    {
+                        // ⚠️ ถ้า Orchestrator จบไปแล้ว (เช่น โควตาเต็มพอดีกับที่มีคนกดมาพร้อมกัน)
+                        // ให้ถือว่าเป็นเรื่องปกติ ไม่ต้อง throw error ให้รก Log
+                        logger.LogWarning($"[Webhook] ⚠️ Orchestrator {body.InstanceId} has already completed or failed. Signal ignored.");
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError($"[Webhook] ❌ Unexpected error raising event: {ex.Message}");
+                    }
                 }
             }
 
